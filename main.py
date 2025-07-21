@@ -2,13 +2,18 @@ import sys
 import cv2
 import numpy as np
 import multiprocessing
+import json
+
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QLineEdit, QGridLayout,
-                             QComboBox, QFrame, QDialog, QTextEdit, QDialogButtonBox)
+                             QComboBox, QFrame, QDialog, QTextEdit, QDialogButtonBox, QMessageBox, QInputDialog)
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 
 from core.workers import camera_worker
+from core.camera_reader import camera_reader # Import the new camera_reader
+from utils.profile_manager import save_profile, load_profile, list_profiles
+from start_screen import StartScreen
 
 # --- New: DetectionConfigDialog ---
 class DetectionConfigDialog(QDialog):
@@ -72,22 +77,29 @@ class CameraFeed(QFrame):
         self.image_label.setText("") # Clear "No Feed" text once frame arrives
 
 class MainWindow(QWidget):
-    def __init__(self):
+    def __init__(self, initial_configs=None):
         super().__init__()
         self.setWindowTitle("Gemini Camera Detection System")
         self.setGeometry(100, 100, 1300, 900) # Adjusted window size
 
-        self.camera_processes = {}
-        self.camera_queues = {}
-        self.camera_stop_events = {}
+        self.camera_processes = {} # Worker processes
+        self.camera_queues = {} # Queues for workers to send frames to main process
+        self.camera_stop_events = {} # Stop events for workers
         self.camera_feeds = {}
-        self.camera_configs = {} # New: Store detection configurations
+        self.camera_configs = {} # Store detection configurations
         self.camera_count = 0
+
+        self.reader_processes = {} # New: Reader processes
+        self.reader_frame_queues = {} # New: Queues for readers to send frames to workers
+        self.reader_stop_events = {} # New: Stop events for readers
 
         self.init_ui()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_feeds)
         self.timer.start(30) # Update every 30 ms
+
+        if initial_configs:
+            self.load_initial_configs(initial_configs)
 
     def init_ui(self):
         main_layout = QVBoxLayout()
@@ -101,9 +113,13 @@ class MainWindow(QWidget):
         self.add_camera_button = QPushButton("Add Camera", self)
         self.add_camera_button.clicked.connect(self.add_camera)
 
+        self.save_profile_button = QPushButton("Save Profile", self)
+        self.save_profile_button.clicked.connect(self.save_current_profile)
+
         control_panel.addWidget(self.source_input)
         control_panel.addWidget(self.model_selector)
         control_panel.addWidget(self.add_camera_button)
+        control_panel.addWidget(self.save_profile_button)
 
         main_layout.addLayout(control_panel)
 
@@ -112,6 +128,39 @@ class MainWindow(QWidget):
         main_layout.addLayout(self.camera_grid_layout)
 
         self.setLayout(main_layout)
+
+    def load_initial_configs(self, configs):
+        for config in configs:
+            source = config['source']
+            model_name = config['model_name']
+            target_classes = config['target_classes']
+
+            camera_id = self.camera_count
+            self.camera_count += 1
+
+            self.camera_configs[camera_id] = {
+                'source': source,
+                'model_name': model_name,
+                'target_classes': target_classes
+            }
+            self._add_camera_to_gui(camera_id)
+            self._start_camera_worker(camera_id)
+
+    def _add_camera_to_gui(self, camera_id):
+        feed_label = CameraFeed(camera_id)
+        self.camera_feeds[camera_id] = feed_label
+
+        # Container for feed and controls
+        camera_container = QVBoxLayout()
+        camera_container.addWidget(feed_label)
+
+        config_button = QPushButton(f"Configure Camera {camera_id}")
+        config_button.clicked.connect(lambda: self.open_detection_config(camera_id))
+        camera_container.addWidget(config_button)
+
+        row = (camera_id) // 2 # 2 cameras per row
+        col = (camera_id) % 2
+        self.camera_grid_layout.addLayout(camera_container, row, col)
 
     def add_camera(self):
         source = self.source_input.text()
@@ -137,23 +186,8 @@ class MainWindow(QWidget):
             'target_classes': [] # Empty list means detect all
         }
 
+        self._add_camera_to_gui(camera_id)
         self._start_camera_worker(camera_id)
-
-        # Add to GUI grid
-        feed_label = CameraFeed(camera_id)
-        self.camera_feeds[camera_id] = feed_label
-
-        # Container for feed and controls
-        camera_container = QVBoxLayout()
-        camera_container.addWidget(feed_label)
-
-        config_button = QPushButton(f"Configure Camera {camera_id}")
-        config_button.clicked.connect(lambda: self.open_detection_config(camera_id))
-        camera_container.addWidget(config_button)
-
-        row = (camera_id) // 2 # 2 cameras per row
-        col = (camera_id) % 2
-        self.camera_grid_layout.addLayout(camera_container, row, col)
 
         self.source_input.clear()
         print(f"Added Camera {camera_id} from source {source} with model {model_name}")
@@ -163,6 +197,20 @@ class MainWindow(QWidget):
         source = config['source']
         model_name = config['model_name']
         target_classes = config['target_classes']
+
+        # --- New: Manage CameraReader process ---
+        if source not in self.reader_processes or not self.reader_processes[source].is_alive():
+            reader_frame_queue = multiprocessing.Queue(maxsize=5) # Buffer for a few frames
+            reader_stop_event = multiprocessing.Event()
+            reader_p = multiprocessing.Process(target=camera_reader, args=(source, reader_frame_queue, reader_stop_event))
+            reader_p.daemon = True
+            reader_p.start()
+            self.reader_processes[source] = reader_p
+            self.reader_frame_queues[source] = reader_frame_queue
+            self.reader_stop_events[source] = reader_stop_event
+            print(f"Started CameraReader for source: {source}")
+        else:
+            reader_frame_queue = self.reader_frame_queues[source]
 
         # Clean up existing worker if any
         if camera_id in self.camera_processes and self.camera_processes[camera_id].is_alive():
@@ -177,14 +225,15 @@ class MainWindow(QWidget):
         output_queue = multiprocessing.Queue(maxsize=1) # Buffer for one frame
         stop_event = multiprocessing.Event()
 
-        p = multiprocessing.Process(target=camera_worker, args=(camera_id, source, model_name, output_queue, stop_event, target_classes))
+        # Pass the reader's frame queue to the worker
+        p = multiprocessing.Process(target=camera_worker, args=(camera_id, reader_frame_queue, output_queue, stop_event, model_name, target_classes))
         p.daemon = True # Allow main process to exit even if workers are running
         p.start()
 
         self.camera_processes[camera_id] = p
         self.camera_queues[camera_id] = output_queue
         self.camera_stop_events[camera_id] = stop_event
-        print(f"Started/Restarted worker for Camera {camera_id} with target classes: {target_classes}")
+        print(f"Started/Restarted worker for Camera {camera_id} (source {source}) with target classes: {target_classes}")
 
     def open_detection_config(self, camera_id):
         current_classes = self.camera_configs[camera_id]['target_classes']
@@ -198,6 +247,22 @@ class MainWindow(QWidget):
             else:
                 print(f"Camera {camera_id} detection classes unchanged.")
 
+    def save_current_profile(self):
+        if not self.camera_configs:
+            QMessageBox.information(self, "No Cameras", "Add cameras before saving a profile.")
+            return
+
+        profile_name, ok = QInputDialog.getText(self, "Save Profile", "Enter profile name:")
+        if ok and profile_name:
+            # Convert camera_configs dictionary to a list for saving
+            configs_to_save = []
+            for cam_id in sorted(self.camera_configs.keys()):
+                configs_to_save.append(self.camera_configs[cam_id])
+            save_profile(profile_name, configs_to_save)
+            QMessageBox.information(self, "Profile Saved", f"Profile '{profile_name}' saved successfully.")
+        elif ok:
+            QMessageBox.warning(self, "Invalid Name", "Profile name cannot be empty.")
+
     def update_feeds(self):
         for camera_id, queue in self.camera_queues.items():
             if not queue.empty():
@@ -209,19 +274,36 @@ class MainWindow(QWidget):
                     print(f"Error getting frame from queue for camera {camera_id}: {e}")
 
     def closeEvent(self, event):
-        print("Closing application. Terminating camera processes...")
+        print("Closing application. Terminating all processes...")
+        # Terminate worker processes
         for camera_id, stop_event in self.camera_stop_events.items():
             stop_event.set() # Signal worker to stop
             if camera_id in self.camera_processes and self.camera_processes[camera_id].is_alive():
                 self.camera_processes[camera_id].join(timeout=1) # Give it a moment to clean up
                 if self.camera_processes[camera_id].is_alive():
                     self.camera_processes[camera_id].terminate() # Force terminate if not stopped
-        print("All camera processes terminated.")
+        print("All worker processes terminated.")
+
+        # Terminate reader processes
+        for source, stop_event in self.reader_stop_events.items():
+            stop_event.set() # Signal reader to stop
+            if source in self.reader_processes and self.reader_processes[source].is_alive():
+                self.reader_processes[source].join(timeout=1) # Give it a moment to clean up
+                if self.reader_processes[source].is_alive():
+                    self.reader_processes[source].terminate() # Force terminate if not stopped
+        print("All reader processes terminated.")
+
         super().closeEvent(event)
 
 if __name__ == "__main__":
     multiprocessing.freeze_support() # For Windows compatibility
     app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec_())
+
+    start_screen = StartScreen()
+    if start_screen.exec_(): # Show the start screen as a modal dialog
+        initial_configs = start_screen.get_selected_profile_config()
+        window = MainWindow(initial_configs) # Pass loaded configs to main window
+        window.show()
+        sys.exit(app.exec_())
+    else:
+        sys.exit(0) # User cancelled start screen
