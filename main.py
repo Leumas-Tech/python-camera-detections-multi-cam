@@ -3,34 +3,66 @@ import cv2
 import numpy as np
 import multiprocessing
 import json
+from multiprocessing import shared_memory
 
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-                             QPushButton, QLabel, QLineEdit, QGridLayout,
-                             QComboBox, QFrame, QDialog, QTextEdit, QDialogButtonBox, QMessageBox, QInputDialog)
+                             QPushButton, QLabel, QGridLayout, QLineEdit,
+                             QComboBox, QFrame, QDialog, QTextEdit, QDialogButtonBox, QMessageBox, QInputDialog, QScrollArea, QCheckBox)
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 
 from core.workers import camera_worker
-from core.camera_reader import camera_reader # Import the new camera_reader
+from core.camera_reader import camera_reader
+from detection.object_detector import ObjectDetector # Import ObjectDetector to get class names
 from utils.profile_manager import save_profile, load_profile, list_profiles
+from utils.camera_manager import get_camera_sources # Import get_camera_sources
 from start_screen import StartScreen
 
-# --- New: DetectionConfigDialog ---
+# --- Modified: DetectionConfigDialog ---
 class DetectionConfigDialog(QDialog):
-    def __init__(self, current_classes, parent=None):
+    def __init__(self, current_classes, model_name, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Configure Detections")
-        self.setGeometry(200, 200, 400, 200)
+        self.setGeometry(200, 200, 500, 600) # Adjusted size for checkboxes
 
         layout = QVBoxLayout()
 
-        self.info_label = QLabel("Enter desired detection classes, separated by commas (e.g., person, car, dog). Leave empty to detect all.")
+        self.info_label = QLabel("Select desired detection classes. No selection means detect all.")
         layout.addWidget(self.info_label)
 
-        self.class_input = QLineEdit(self)
-        self.class_input.setPlaceholderText("person, car, dog")
-        self.class_input.setText(", ".join(current_classes))
-        layout.addWidget(self.class_input)
+        # Get all available classes from the model
+        try:
+            temp_detector = ObjectDetector(model_name=model_name)
+            self.all_classes = sorted(list(temp_detector.model.names.values()))
+        except Exception as e:
+            QMessageBox.warning(self, "Model Load Error", f"Could not load model {model_name} to get class names: {e}. Please ensure the model is downloaded and accessible.")
+            self.all_classes = [] # Fallback to empty list
+
+        # Scroll area for checkboxes
+        self.scroll_area = QScrollArea(self)
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_content = QWidget()
+        self.checkbox_layout = QVBoxLayout(self.scroll_content)
+        self.scroll_area.setWidget(self.scroll_content)
+        layout.addWidget(self.scroll_area)
+
+        self.checkboxes = []
+        for cls in self.all_classes:
+            checkbox = QCheckBox(cls)
+            if cls in current_classes:
+                checkbox.setChecked(True)
+            self.checkboxes.append(checkbox)
+            self.checkbox_layout.addWidget(checkbox)
+
+        # Select All / Deselect All buttons
+        select_buttons_layout = QHBoxLayout()
+        select_all_button = QPushButton("Select All")
+        select_all_button.clicked.connect(self.select_all_checkboxes)
+        deselect_all_button = QPushButton("Deselect All")
+        deselect_all_button.clicked.connect(self.deselect_all_checkboxes)
+        select_buttons_layout.addWidget(select_all_button)
+        select_buttons_layout.addWidget(deselect_all_button)
+        layout.addLayout(select_buttons_layout)
 
         self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.button_box.accepted.connect(self.accept)
@@ -39,11 +71,20 @@ class DetectionConfigDialog(QDialog):
 
         self.setLayout(layout)
 
+    def select_all_checkboxes(self):
+        for checkbox in self.checkboxes:
+            checkbox.setChecked(True)
+
+    def deselect_all_checkboxes(self):
+        for checkbox in self.checkboxes:
+            checkbox.setChecked(False)
+
     def get_selected_classes(self):
-        text = self.class_input.text().strip()
-        if not text:
-            return []
-        return [cls.strip() for cls in text.split(',') if cls.strip()]
+        selected = []
+        for checkbox in self.checkboxes:
+            if checkbox.isChecked():
+                selected.append(checkbox.text())
+        return selected
 
 # --- Modified: CameraFeed to be a QFrame with fixed size ---
 class CameraFeed(QFrame):
@@ -77,6 +118,9 @@ class CameraFeed(QFrame):
         self.image_label.setText("") # Clear "No Feed" text once frame arrives
 
 class MainWindow(QWidget):
+    # Define a reasonable max frame size for shared memory (e.g., 1920x1080x3 bytes)
+    MAX_FRAME_SIZE = 2560 * 1440 * 3 # Increased to support 1440p resolution
+
     def __init__(self, initial_configs=None):
         super().__init__()
         self.setWindowTitle("Gemini Camera Detection System")
@@ -89,11 +133,13 @@ class MainWindow(QWidget):
         self.camera_configs = {} # Store detection configurations
         self.camera_count = 0
 
-        self.reader_processes = {} # New: Reader processes
-        self.reader_frame_queues = {} # New: Queues for readers to send frames to workers
-        self.reader_stop_events = {} # New: Stop events for readers
+        self.reader_processes = {} # Reader processes
+        self.reader_frame_notification_queues = {} # Queues for readers to send frame info to workers
+        self.reader_stop_events = {} # Stop events for readers
+        self.shared_memories = {} # New: Store SharedMemory objects
 
         self.init_ui()
+        self.populate_camera_sources()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_feeds)
         self.timer.start(30) # Update every 30 ms
@@ -106,8 +152,9 @@ class MainWindow(QWidget):
 
         # Control Panel
         control_panel = QHBoxLayout()
-        self.source_input = QLineEdit(self)
-        self.source_input.setPlaceholderText("Camera Source (e.g., 0, 1, or RTSP URL)")
+        self.source_selector = QComboBox(self) # For available camera sources
+        self.manual_source_input = QLineEdit(self) # For manual input (e.g., RTSP)
+        self.manual_source_input.setPlaceholderText("Or enter camera source (e.g., 0, 1, or RTSP URL)")
         self.model_selector = QComboBox(self)
         self.model_selector.addItems(["yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt"])
         self.add_camera_button = QPushButton("Add Camera", self)
@@ -116,7 +163,8 @@ class MainWindow(QWidget):
         self.save_profile_button = QPushButton("Save Profile", self)
         self.save_profile_button.clicked.connect(self.save_current_profile)
 
-        control_panel.addWidget(self.source_input)
+        control_panel.addWidget(self.source_selector)
+        control_panel.addWidget(self.manual_source_input)
         control_panel.addWidget(self.model_selector)
         control_panel.addWidget(self.add_camera_button)
         control_panel.addWidget(self.save_profile_button)
@@ -128,6 +176,21 @@ class MainWindow(QWidget):
         main_layout.addLayout(self.camera_grid_layout)
 
         self.setLayout(main_layout)
+        self.populate_camera_sources()
+
+    def populate_camera_sources(self):
+        self.available_camera_sources = get_camera_sources()
+        if not self.available_camera_sources:
+            self.source_selector.addItem("No cameras found")
+            self.source_selector.setEnabled(False)
+            self.add_camera_button.setEnabled(False)
+        else:
+            for source in self.available_camera_sources:
+                self.source_selector.addItem(str(source))
+            self.source_selector.setEnabled(True)
+            self.add_camera_button.setEnabled(True)
+
+    
 
     def load_initial_configs(self, configs):
         for config in configs:
@@ -163,11 +226,18 @@ class MainWindow(QWidget):
         self.camera_grid_layout.addLayout(camera_container, row, col)
 
     def add_camera(self):
-        source = self.source_input.text()
+        manual_source = self.manual_source_input.text().strip()
+        selected_source = self.source_selector.currentText()
         model_name = self.model_selector.currentText()
 
+        source = None
+        if manual_source:
+            source = manual_source
+        elif selected_source and selected_source != "No cameras found":
+            source = selected_source
+
         if not source:
-            print("Please enter a camera source.")
+            print("Please select or enter a camera source.")
             return
 
         try:
@@ -189,7 +259,18 @@ class MainWindow(QWidget):
         self._add_camera_to_gui(camera_id)
         self._start_camera_worker(camera_id)
 
-        self.source_input.clear()
+        # Clear manual input after adding
+        self.manual_source_input.clear()
+
+        # Remove selected item from dropdown if it was a detected camera
+        if selected_source and selected_source != "No cameras found" and not manual_source:
+            current_index = self.source_selector.currentIndex()
+            self.source_selector.removeItem(current_index)
+            if self.source_selector.count() == 0:
+                self.source_selector.addItem("No more cameras available")
+                self.source_selector.setEnabled(False)
+                self.add_camera_button.setEnabled(False)
+
         print(f"Added Camera {camera_id} from source {source} with model {model_name}")
 
     def _start_camera_worker(self, camera_id):
@@ -198,19 +279,31 @@ class MainWindow(QWidget):
         model_name = config['model_name']
         target_classes = config['target_classes']
 
-        # --- New: Manage CameraReader process ---
+        # --- New: Manage CameraReader process and Shared Memory ---
         if source not in self.reader_processes or not self.reader_processes[source].is_alive():
-            reader_frame_queue = multiprocessing.Queue(maxsize=5) # Buffer for a few frames
+            # Create shared memory for this source
+            try:
+                shm = shared_memory.SharedMemory(create=True, size=self.MAX_FRAME_SIZE)
+                self.shared_memories[source] = shm
+                shared_mem_name = shm.name
+                shared_mem_size = shm.size
+            except Exception as e:
+                print(f"Error creating shared memory for source {source}: {e}")
+                return
+
+            frame_notification_queue = multiprocessing.Queue(maxsize=5) # Buffer for a few frame notifications
             reader_stop_event = multiprocessing.Event()
-            reader_p = multiprocessing.Process(target=camera_reader, args=(source, reader_frame_queue, reader_stop_event))
+            reader_p = multiprocessing.Process(target=camera_reader, args=(source, shared_mem_name, shared_mem_size, frame_notification_queue, reader_stop_event))
             reader_p.daemon = True
             reader_p.start()
             self.reader_processes[source] = reader_p
-            self.reader_frame_queues[source] = reader_frame_queue
+            self.reader_frame_notification_queues[source] = frame_notification_queue
             self.reader_stop_events[source] = reader_stop_event
-            print(f"Started CameraReader for source: {source}")
+            print(f"Started CameraReader for source: {source} with shared memory: {shared_mem_name}")
         else:
-            reader_frame_queue = self.reader_frame_queues[source]
+            shared_mem_name = self.shared_memories[source].name
+            shared_mem_size = self.shared_memories[source].size
+            frame_notification_queue = self.reader_frame_notification_queues[source]
 
         # Clean up existing worker if any
         if camera_id in self.camera_processes and self.camera_processes[camera_id].is_alive():
@@ -225,8 +318,8 @@ class MainWindow(QWidget):
         output_queue = multiprocessing.Queue(maxsize=1) # Buffer for one frame
         stop_event = multiprocessing.Event()
 
-        # Pass the reader's frame queue to the worker
-        p = multiprocessing.Process(target=camera_worker, args=(camera_id, reader_frame_queue, output_queue, stop_event, model_name, target_classes))
+        # Pass shared memory details and notification queue to the worker
+        p = multiprocessing.Process(target=camera_worker, args=(camera_id, shared_mem_name, shared_mem_size, frame_notification_queue, output_queue, stop_event, model_name, target_classes))
         p.daemon = True # Allow main process to exit even if workers are running
         p.start()
 
@@ -237,7 +330,8 @@ class MainWindow(QWidget):
 
     def open_detection_config(self, camera_id):
         current_classes = self.camera_configs[camera_id]['target_classes']
-        dialog = DetectionConfigDialog(current_classes, self)
+        model_name = self.camera_configs[camera_id]['model_name'] # Get model name for the dialog
+        dialog = DetectionConfigDialog(current_classes, model_name, self) # Pass model_name
         if dialog.exec_():
             new_classes = dialog.get_selected_classes()
             if new_classes != current_classes:
@@ -284,14 +378,18 @@ class MainWindow(QWidget):
                     self.camera_processes[camera_id].terminate() # Force terminate if not stopped
         print("All worker processes terminated.")
 
-        # Terminate reader processes
+        # Terminate reader processes and unlink shared memory
         for source, stop_event in self.reader_stop_events.items():
             stop_event.set() # Signal reader to stop
             if source in self.reader_processes and self.reader_processes[source].is_alive():
                 self.reader_processes[source].join(timeout=1) # Give it a moment to clean up
                 if self.reader_processes[source].is_alive():
                     self.reader_processes[source].terminate() # Force terminate if not stopped
-        print("All reader processes terminated.")
+            # Unlink shared memory
+            if source in self.shared_memories:
+                self.shared_memories[source].close()
+                self.shared_memories[source].unlink() # Unlink to release resources
+        print("All reader processes and shared memories terminated/unlinked.")
 
         super().closeEvent(event)
 
