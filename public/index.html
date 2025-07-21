@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Multi-Camera System</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <h1>Multi-Camera Live Feed</h1>
+    <div class="controls">
+        <div class="camera-type-selection">
+            <input type="radio" id="localCamera" name="cameraType" value="local" checked>
+            <label for="localCamera">Local Camera</label>
+            <input type="radio" id="ipCamera" name="cameraType" value="ip">
+            <label for="ipCamera">IP Camera (RTSP/HTTP)</label>
+        </div>
+        <div id="localCameraSelection" class="camera-input-group">
+            <select id="localCameraDropdown">
+                <option value="">Loading cameras...</option>
+            </select>
+        </div>
+        <div id="ipCameraInput" class="camera-input-group" style="display: none;">
+            <input type="text" id="ipCameraSourceInput" placeholder="Enter IP camera URL (e.g., rtsp://your.camera.ip/stream)">
+        </div>
+        <button id="addCameraButton">Add Camera</button>
+    </div>
+    <div id="cameraGrid" class="camera-grid">
+        <!-- Camera feeds will be added here -->
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="script.js"></script>
+</body>
+</html>
