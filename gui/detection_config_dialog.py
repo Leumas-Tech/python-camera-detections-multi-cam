@@ -4,7 +4,7 @@ from detection.object_detector import ObjectDetector
 from gui.stylesheet import get_stylesheet
 
 class DetectionConfigDialog(QDialog):
-    def __init__(self, current_classes, model_name, parent=None):
+    def __init__(self, current_config, model_name, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Configure Detections")
         self.setGeometry(200, 200, 500, 600) # Adjusted size for checkboxes
@@ -16,6 +16,11 @@ class DetectionConfigDialog(QDialog):
 
         self.info_label = QLabel("Select desired detection classes. No selection means detect all.")
         layout.addWidget(self.info_label)
+
+        # New: Face Detection Checkbox
+        self.face_detection_checkbox = QCheckBox("Enable Face Detection")
+        self.face_detection_checkbox.setChecked(current_config.get('enable_face_detection', False))
+        layout.addWidget(self.face_detection_checkbox)
 
         # Get all available classes from the model
         try:
@@ -34,9 +39,10 @@ class DetectionConfigDialog(QDialog):
         layout.addWidget(self.scroll_area)
 
         self.checkboxes = []
+        current_object_classes = current_config.get('target_classes', [])
         for cls in self.all_classes:
             checkbox = QCheckBox(cls)
-            if cls in current_classes:
+            if cls in current_object_classes:
                 checkbox.setChecked(True)
             self.checkboxes.append(checkbox)
             self.checkbox_layout.addWidget(checkbox)
@@ -66,9 +72,12 @@ class DetectionConfigDialog(QDialog):
         for checkbox in self.checkboxes:
             checkbox.setChecked(False)
 
-    def get_selected_classes(self):
-        selected = []
+    def get_selected_config(self):
+        selected_classes = []
         for checkbox in self.checkboxes:
             if checkbox.isChecked():
-                selected.append(checkbox.text())
-        return selected
+                selected_classes.append(checkbox.text())
+        return {
+            'target_classes': selected_classes,
+            'enable_face_detection': self.face_detection_checkbox.isChecked()
+        }

@@ -136,7 +136,8 @@ class MainWindow(QWidget):
             self.camera_configs[camera_id] = {
                 'source': source,
                 'model_name': model_name,
-                'target_classes': target_classes
+                'target_classes': target_classes,
+                'enable_face_detection': False # New: Default to False
             }
             self._add_camera_to_gui(camera_id)
         self._start_camera_worker(camera_id)
@@ -228,7 +229,8 @@ class MainWindow(QWidget):
         self.camera_configs[camera_id] = {
             'source': source,
             'model_name': model_name,
-            'target_classes': [] # Empty list means detect all
+            'target_classes': [], # Empty list means detect all
+            'enable_face_detection': False # New: Default to False
         }
 
         self._add_camera_to_gui(camera_id)
@@ -253,6 +255,7 @@ class MainWindow(QWidget):
         source = config['source']
         model_name = config['model_name']
         target_classes = config['target_classes']
+        enable_face_detection = config['enable_face_detection']
 
         # --- New: Manage CameraReader process and Shared Memory ---
         if source not in self.reader_processes or not self.reader_processes[source].is_alive():
@@ -294,27 +297,27 @@ class MainWindow(QWidget):
         stop_event = multiprocessing.Event()
 
         # Pass shared memory details and notification queue to the worker
-        p = multiprocessing.Process(target=camera_worker, args=(camera_id, shared_mem_name, shared_mem_size, frame_notification_queue, output_queue, stop_event, model_name, target_classes))
+        p = multiprocessing.Process(target=camera_worker, args=(camera_id, shared_mem_name, shared_mem_size, frame_notification_queue, output_queue, stop_event, model_name, target_classes, enable_face_detection))
         p.daemon = True # Allow main process to exit even if workers are running
         p.start()
 
         self.camera_processes[camera_id] = p
         self.camera_queues[camera_id] = output_queue
         self.camera_stop_events[camera_id] = stop_event
-        print(f"Started/Restarted worker for Camera {camera_id} (source {source}) with target classes: {target_classes}")
+        print(f"Started/Restarted worker for Camera {camera_id} (source {source}) with target classes: {target_classes}, Face Detection: {enable_face_detection}")
 
     def open_detection_config(self, camera_id):
-        current_classes = self.camera_configs[camera_id]['target_classes']
-        model_name = self.camera_configs[camera_id]['model_name'] # Get model name for the dialog
-        dialog = DetectionConfigDialog(current_classes, model_name, self) # Pass model_name
+        current_config = self.camera_configs[camera_id]
+        model_name = current_config['model_name'] # Get model name for the dialog
+        dialog = DetectionConfigDialog(current_config, model_name, self) # Pass entire config
         if dialog.exec_():
-            new_classes = dialog.get_selected_classes()
-            if new_classes != current_classes:
-                self.camera_configs[camera_id]['target_classes'] = new_classes
-                print(f"Camera {camera_id} detection classes updated to: {new_classes}")
+            new_config = dialog.get_selected_config()
+            if new_config != current_config:
+                self.camera_configs[camera_id].update(new_config)
+                print(f"Camera {camera_id} configuration updated to: {new_config}")
                 self._start_camera_worker(camera_id) # Restart worker with new config
             else:
-                print(f"Camera {camera_id} detection classes unchanged.")
+                print(f"Camera {camera_id} configuration unchanged.")
 
     def save_current_profile(self):
         if not self.camera_configs:
