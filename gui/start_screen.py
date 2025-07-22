@@ -1,7 +1,9 @@
+
 import sys
 from PyQt5.QtWidgets import (QApplication, QDialog, QVBoxLayout, QHBoxLayout,
                              QPushButton, QListWidget, QLineEdit, QLabel, QMessageBox)
 from PyQt5.QtCore import Qt
+from gui.stylesheet import get_stylesheet
 
 from utils.profile_manager import list_profiles, load_profile
 
@@ -9,8 +11,9 @@ class StartScreen(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Gemini Camera Detection System - Start")
-        self.setGeometry(300, 300, 400, 300)
-        self.setModal(True) # Make it a modal dialog
+        self.setGeometry(300, 300, 400, 350)
+        self.setModal(True)
+        self.setStyleSheet(get_stylesheet())
 
         self.selected_profile_config = None
 
@@ -19,21 +22,20 @@ class StartScreen(QDialog):
 
     def init_ui(self):
         main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(15)
 
         # New Session
         new_session_layout = QHBoxLayout()
-        new_session_layout.addWidget(QLabel("Start New Session:"))
+        new_session_label = QLabel("Start a new session or load an existing profile.")
+        new_session_label.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(new_session_label)
+
         self.new_session_button = QPushButton("New Session")
         self.new_session_button.clicked.connect(self.start_new_session)
-        new_session_layout.addWidget(self.new_session_button)
-        main_layout.addLayout(new_session_layout)
-
-        main_layout.addStretch(1)
+        main_layout.addWidget(self.new_session_button)
 
         # Load Profile
-        load_profile_label = QLabel("Load Existing Profile:")
-        main_layout.addWidget(load_profile_label)
-
         self.profile_list_widget = QListWidget()
         self.profile_list_widget.itemDoubleClicked.connect(self.load_selected_profile)
         main_layout.addWidget(self.profile_list_widget)
@@ -84,16 +86,3 @@ class StartScreen(QDialog):
 
     def get_selected_profile_config(self):
         return self.selected_profile_config
-
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    start_screen = StartScreen()
-    if start_screen.exec_():
-        config = start_screen.get_selected_profile_config()
-        if config is not None:
-            print("Loaded config:", config)
-        else:
-            print("Starting new session.")
-    else:
-        print("Start screen cancelled.")
-    sys.exit(0)
