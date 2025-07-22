@@ -1,6 +1,7 @@
 
 import multiprocessing
 from multiprocessing import shared_memory
+import queue as _queue   # at top of file, so you can catch Empty
 
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLineEdit,
@@ -28,7 +29,9 @@ class MainWindow(QWidget):
         self.camera_processes = {} # Worker processes
         self.camera_queues = {} # Queues for workers to send frames to main process
         self.camera_stop_events = {} # Stop events for workers
-        self.camera_feeds = {}
+        # camera_feeds will hold the container QWidget
+        self.camera_feeds = {} # camera_feeds will hold the container QWidget
+        self.camera_feed_widgets = {} # camera_feed_widgets holds the actual CameraFeed instances for update_frame()
         self.camera_configs = {} # Store detection configurations
         self.camera_count = 0
         self.current_page = 0
@@ -44,7 +47,7 @@ class MainWindow(QWidget):
         self.populate_camera_sources()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_feeds)
-        self.timer.start(30) # Update every 30 ms
+        self.timer.start(50) # Update every 30 ms
 
         if initial_configs:
             self.load_initial_configs(initial_configs)
@@ -181,7 +184,20 @@ class MainWindow(QWidget):
 
     def _add_camera_to_gui(self, camera_id):
         feed_label = CameraFeed(camera_id, self.camera_size)
-        self.camera_feeds[camera_id] = feed_label
+        self.camera_feed_widgets[camera_id] = feed_label # Store the actual CameraFeed widget
+
+        # Create a layout for each camera feed to include the config button
+        camera_layout = QVBoxLayout()
+        camera_layout.addWidget(feed_label)
+
+        config_button = QPushButton("Configure Detections", self)
+        config_button.clicked.connect(lambda: self.open_detection_config(camera_id))
+        camera_layout.addWidget(config_button)
+
+        # Create a QWidget to hold the camera_layout so it can be added to the grid
+        camera_container = QWidget()
+        camera_container.setLayout(camera_layout)
+        self.camera_feeds[camera_id] = camera_container # Store the container, not just the feed_label
         self.update_grid()
 
     def add_camera(self):
@@ -250,7 +266,7 @@ class MainWindow(QWidget):
                 print(f"Error creating shared memory for source {source}: {e}")
                 return
 
-            frame_notification_queue = multiprocessing.Queue(maxsize=5) # Buffer for a few frame notifications
+            frame_notification_queue = multiprocessing.Queue(maxsize=10) # Buffer for a few frame notifications
             reader_stop_event = multiprocessing.Event()
             reader_p = multiprocessing.Process(target=camera_reader, args=(source, shared_mem_name, shared_mem_size, frame_notification_queue, reader_stop_event))
             reader_p.daemon = True
@@ -317,14 +333,25 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "Invalid Name", "Profile name cannot be empty.")
 
     def update_feeds(self):
-        for camera_id, queue in self.camera_queues.items():
-            if not queue.empty():
-                try:
-                    frame_id, frame = queue.get_nowait()
-                    if frame_id in self.camera_feeds:
-                        self.camera_feeds[frame_id].update_frame(frame)
-                except Exception as e:
-                    print(f"Error getting frame from queue for camera {camera_id}: {e}")
+        for cam_id, q in self.camera_queues.items():
+            try:
+                item = q.get_nowait()
+            except _queue.Empty:
+                # nothing to do this cycle
+                continue
+            except Exception as e:
+                print(f"[Main] Error reading from camera {cam_id} queue: {e}")
+                continue
+
+            # only accept (id, frame) tuples
+            if not (isinstance(item, tuple) and len(item) == 2):
+                # skip over notifications or stray ints
+                continue
+
+            frame_id, frame = item
+            widget = self.camera_feed_widgets.get(frame_id)
+            if widget:
+                widget.update_frame(frame)
 
     def closeEvent(self, event):
         print("Closing application. Terminating all processes...")
